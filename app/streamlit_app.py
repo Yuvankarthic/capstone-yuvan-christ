@@ -16,6 +16,7 @@ from src.forecasting import DEFAULT_DATA_PATH as FORECAST_DATA_PATH, run_sales_f
 from src.model_training import DEFAULT_DATA_PATH, DEFAULT_MODEL_PATH, load_trained_artifact, train_sales_model
 from src.prediction import predict_sales
 from src.preprocessing import engineer_features, load_sales_data
+from src.upload_detection import SALES_REQUIRED_COLUMNS, analyse_uploaded_file
 
 st.set_page_config(
     page_title="AI-Powered Business Intelligence Platform",
@@ -362,6 +363,285 @@ def render_metric_card(label: str, value: str, detail: str) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+@st.cache_data(show_spinner=False)
+def analyse_upload(payload: bytes, filename: str) -> dict:
+    return analyse_uploaded_file(payload, filename)
+
+
+def render_upload_view() -> None:
+    render_section(
+        "File Upload",
+        "Upload & Detect",
+        "Upload a CSV or Excel file to profile it, run data-quality checks, and let the model flag anomalous rows.",
+    )
+
+    uploaded_file = st.file_uploader(
+        "Choose a CSV or Excel file",
+        type=["csv", "txt", "tsv", "xls", "xlsx", "xlsm"],
+        help="Excel workbooks are read from the first sheet. CSV and TSV files are supported.",
+    )
+
+    if uploaded_file is None:
+        st.info("Upload a CSV or Excel file to run profiling, data-quality checks, and anomaly detection.")
+        st.markdown("#### Full sales schema (optional)")
+        st.caption(
+            "When an uploaded file contains every column listed below, the project's sales-specific detection pipeline runs as well."
+        )
+        st.dataframe(
+            pd.DataFrame({"required_column": SALES_REQUIRED_COLUMNS}),
+            width="stretch",
+            hide_index=True,
+        )
+        return
+
+    payload = uploaded_file.getvalue()
+    try:
+        analysis = analyse_upload(payload, uploaded_file.name)
+    except Exception as exc:
+        st.error(f"Could not analyse the uploaded file: {exc}")
+        return
+
+    profile = analysis["profile"]
+    quality = analysis["quality"]
+    detection = analysis["detection"]
+    roles = analysis["roles"]
+
+    profile_col1, profile_col2, profile_col3, profile_col4 = st.columns(4, gap="small")
+    with profile_col1:
+        render_metric_card("Rows", f"{profile['rows']:,}", "Data records analysed")
+    with profile_col2:
+        render_metric_card("Columns", f"{profile['columns']:,}", "Usable fields detected")
+    with profile_col3:
+        render_metric_card("Missing Cells", f"{profile['missing_pct']:.2f}%", f"{profile['missing_cells']:,} empty values")
+    with profile_col4:
+        render_metric_card("Duplicate Rows", f"{profile['duplicate_rows']:,}", "Exact duplicate records")
+
+    st.markdown("### Column roles")
+    role_col1, role_col2, role_col3 = st.columns(3)
+    with role_col1:
+        render_metric_card("Date Columns", str(len(roles["date"])), ", ".join(roles["date"]) or "None detected")
+    with role_col2:
+        render_metric_card("Numeric Columns", str(len(roles["numeric"])), ", ".join(roles["numeric"][:4]) or "None detected")
+    with role_col3:
+        render_metric_card("Categorical Columns", str(len(roles["categorical"])), ", ".join(roles["categorical"][:4]) or "None detected")
+
+    st.markdown("### Data preview")
+    st.dataframe(analysis["dataframe"].head(20), width="stretch", hide_index=True)
+
+    render_section(
+        "File Upload 2",
+        "Data Quality Detection",
+        "Missing values, duplicate records, constant columns, and per-column IQR outlier checks.",
+    )
+    outlier_total = 0
+    if isinstance(quality["outliers"], pd.DataFrame) and not quality["outliers"].empty:
+        outlier_total = int(quality["outliers"]["outlier_count"].sum())
+
+    quality_col1, quality_col2, quality_col3, quality_col4 = st.columns(4, gap="small")
+    with quality_col1:
+        render_metric_card("Columns With Missing Data", str(len(quality["missing"])), "Columns containing empty values")
+    with quality_col2:
+        render_metric_card("IQR Outliers Flagged", f"{outlier_total:,}", "Values outside 1.5 x IQR bounds")
+    with quality_col3:
+        render_metric_card("Constant Columns", str(len(quality["constant_columns"])), ", ".join(quality["constant_columns"][:3]) or "None detected")
+    with quality_col4:
+        render_metric_card("Negative Values", str(len(quality["negatives"])), "Numeric columns containing negatives")
+
+    if not quality["missing"].empty:
+        st.markdown("### Missing values per column")
+        missing_chart = px.bar(
+            quality["missing"],
+            x="column",
+            y="missing_pct",
+            labels={"column": "Column", "missing_pct": "Missing %"},
+            color="missing_pct",
+            color_continuous_scale=["#dbeafe", "#0ea5e9", "#dc2626"],
+        )
+        missing_chart.update_layout(template="plotly_white", height=380, margin=dict(l=10, r=10, t=40, b=10), coloraxis_showscale=False)
+        st.plotly_chart(missing_chart, width="stretch")
+
+    quality_tabs = st.tabs(["Missing values", "IQR outliers", "Negative values"])
+    with quality_tabs[0]:
+        if quality["missing"].empty:
+            st.success("No missing values found.")
+        else:
+            st.dataframe(quality["missing"], width="stretch", hide_index=True)
+    with quality_tabs[1]:
+        if not isinstance(quality["outliers"], pd.DataFrame) or quality["outliers"].empty:
+            st.success("No IQR outliers detected in numeric columns.")
+        else:
+            st.dataframe(quality["outliers"].sort_values("outlier_pct", ascending=False), width="stretch", hide_index=True)
+    with quality_tabs[2]:
+        if not isinstance(quality["negatives"], pd.DataFrame) or quality["negatives"].empty:
+            st.success("No negative values detected.")
+        else:
+            st.dataframe(quality["negatives"], width="stretch", hide_index=True)
+
+    if quality["constant_columns"]:
+        st.warning(f"Constant columns detected: {', '.join(quality['constant_columns'])}")
+
+    render_section(
+        "File Upload 3",
+        "Anomaly Detection",
+        "Isolation Forest scores every row and flags the most unusual combinations of values for review.",
+    )
+    detection_col1, detection_col2, detection_col3, detection_col4 = st.columns(4, gap="small")
+    with detection_col1:
+        render_metric_card("Model", "IsolationForest", "Unsupervised anomaly detection")
+    with detection_col2:
+        render_metric_card("Observations", f"{detection['observation_count']:,}", "Rows scored by the model")
+    with detection_col3:
+        render_metric_card("Anomalies Detected", f"{detection['anomaly_count']:,}", "Rows flagged as unusual")
+    with detection_col4:
+        render_metric_card("Anomaly Rate", f"{detection['anomaly_percentage']:.2f}%", "Share of rows flagged")
+
+    result_df = detection["result"]
+    chart_df = result_df.copy()
+    chart_df["status"] = chart_df["anomaly_flag"].map({-1: "Anomaly", 1: "Normal"})
+
+    score_fig = px.histogram(
+        chart_df,
+        x="anomaly_score",
+        color="status",
+        nbins=40,
+        labels={"anomaly_score": "Anomaly Score", "status": "Status"},
+        color_discrete_map={"Anomaly": "#dc2626", "Normal": "#0ea5e9"},
+    )
+    score_fig.update_layout(
+        template="plotly_white",
+        title="Anomaly Score Distribution",
+        height=420,
+        margin=dict(l=10, r=10, t=55, b=10),
+        legend_title_text="",
+    )
+    st.plotly_chart(score_fig, width="stretch")
+
+    score_col1, score_col2 = st.columns([1.2, 1], gap="large")
+    with score_col1:
+        scatter_source = chart_df.copy()
+        if roles["date"]:
+            date_column = roles["date"][0]
+            scatter_source["timeline"] = pd.to_datetime(scatter_source[date_column], errors="coerce")
+            scatter_x, scatter_title = "timeline", "Anomaly Score Over Time"
+        else:
+            scatter_source["timeline"] = range(len(scatter_source))
+            scatter_x, scatter_title = "timeline", "Anomaly Score By Row Order"
+        scatter_fig = px.scatter(
+            scatter_source,
+            x=scatter_x,
+            y="anomaly_score",
+            color="status",
+            color_discrete_map={"Anomaly": "#dc2626", "Normal": "#94a3b8"},
+        )
+        scatter_fig.update_layout(
+            template="plotly_white",
+            title=scatter_title,
+            height=420,
+            margin=dict(l=10, r=10, t=55, b=10),
+            legend_title_text="",
+        )
+        st.plotly_chart(scatter_fig, width="stretch")
+
+    with score_col2:
+        category_columns = [
+            column
+            for column in roles["categorical"]
+            if 1 < chart_df[column].nunique(dropna=True) <= 20
+        ]
+        if category_columns:
+            group_column = category_columns[0]
+            grouped = (
+                chart_df.assign(is_anomaly=(chart_df["anomaly_flag"] == -1).astype(int))
+                .groupby(group_column, dropna=False)["is_anomaly"]
+                .mean()
+                .reset_index()
+                .rename(columns={"is_anomaly": "anomaly_rate"})
+                .sort_values("anomaly_rate", ascending=False)
+            )
+            grouped["anomaly_rate"] = grouped["anomaly_rate"] * 100
+            rate_fig = px.bar(
+                grouped,
+                x=group_column,
+                y="anomaly_rate",
+                labels={"anomaly_rate": "Anomaly Rate %", group_column: group_column},
+                color="anomaly_rate",
+                color_continuous_scale=["#dbeafe", "#f59e0b", "#dc2626"],
+            )
+            rate_fig.update_layout(
+                template="plotly_white",
+                title=f"Anomaly Rate By {group_column}",
+                height=420,
+                margin=dict(l=10, r=10, t=55, b=10),
+                coloraxis_showscale=False,
+            )
+            st.plotly_chart(rate_fig, width="stretch")
+        else:
+            st.markdown("### Features used by the model")
+            st.write(", ".join(detection["features_used"]))
+
+    flagged = result_df[result_df["anomaly_flag"] == -1].copy()
+    st.markdown("### Flagged anomalies")
+    if flagged.empty:
+        st.success("No rows were flagged as anomalies with the current settings.")
+    else:
+        st.dataframe(flagged.head(50), width="stretch", hide_index=True)
+        st.download_button(
+            "Download flagged rows as CSV",
+            data=flagged.to_csv(index=False).encode("utf-8"),
+            file_name=f"{Path(uploaded_file.name).stem}_anomalies.csv",
+            mime="text/csv",
+        )
+
+    st.markdown("### Model feature importance")
+    st.caption(f"Features used: {', '.join(detection['features_used'])}")
+
+    if analysis["sales_detection"] is not None:
+        render_section(
+            "File Upload 4",
+            "Sales Pipeline Detection",
+            "The uploaded file matches the full sales schema, so the project's own detection pipeline also ran.",
+        )
+        sales = analysis["sales_detection"]
+        sales_col1, sales_col2, sales_col3 = st.columns(3, gap="small")
+        with sales_col1:
+            render_metric_card("Observations", f"{sales['observation_count']:,}", "Rows analysed by the sales pipeline")
+        with sales_col2:
+            render_metric_card("Anomalies", f"{sales['anomaly_count']:,}", "Isolation Forest flagged records")
+        with sales_col3:
+            render_metric_card("Anomaly Rate", f"{sales['anomaly_percentage']:.2f}%", "Share of rows flagged")
+
+        sales_result = sales["result"]
+        sales_columns = [
+            column
+            for column in ["date", "store", "region", "product_category", "sales_amount", "anomaly_score", "anomaly_flag"]
+            if column in sales_result.columns
+        ]
+        st.dataframe(sales_result[sales_columns].head(50), width="stretch", hide_index=True)
+    elif analysis.get("sales_detection_error"):
+        st.warning(
+            "The file matches the full sales schema, but the sales-specific pipeline could not run: "
+            f"{analysis['sales_detection_error']}. "
+            "The general profiling, quality checks, and anomaly detection above are unaffected."
+        )
+    else:
+        st.caption(
+            "Tip: upload a file that contains the full sales schema to also run the project's sales-specific pipeline."
+        )
+
+
+with st.sidebar:
+    st.header("Data Source")
+    data_source = st.radio(
+        "Analyze",
+        ["Sample dataset", "Upload CSV / Excel"],
+        help="Switch between the bundled sample dataset and your own CSV/Excel file.",
+    )
+
+if data_source == "Upload CSV / Excel":
+    render_upload_view()
+    st.stop()
+
 
 forecast_bundle = load_forecast_bundle()
 anomaly_bundle = load_anomaly_bundle()
